@@ -11,131 +11,196 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Consumer;
 
 @Slf4j
-public class TarantoolKvRepository implements KvRepository {
+public final class TarantoolKvRepository implements KvRepository {
 
-    private static final int    BATCH_SIZE = 1_000;
+    private static final int BATCH_SIZE = 1_000;
     private static final String SPACE_NAME = "KV";
+    private static final String COUNT_QUERY = "return box.space." + SPACE_NAME + ":len()";
+
+    private static final int KEY_FIELD_INDEX = 0;
+    private static final int VALUE_FIELD_INDEX = 1;
+    private static final int RECORD_FIELD_COUNT = 2;
 
     private final TarantoolBoxClient client;
-    private final TarantoolBoxSpace  space;
+    private final TarantoolBoxSpace space;
 
     public TarantoolKvRepository(TarantoolBoxClient client) {
-        this.client = client;
-        this.space  = client.space(SPACE_NAME);
+        this.client = Objects.requireNonNull(client, "client must not be null");
+        this.space = this.client.space(SPACE_NAME);
     }
 
     @Override
     public void put(KvRecord record) {
+        Objects.requireNonNull(record, "record must not be null");
+
         try {
             space.replace(Arrays.asList(record.key(), record.value())).get();
-            log.debug("put key={}", record.key());
-        } catch (Exception e) {
-            log.error("put failed: key={}", record.key(), e);
+            log.debug("Put succeeded for key={}", record.key());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Put interrupted for key={}", record.key(), e);
+            throw new StorageException("put", e);
+        } catch (ExecutionException | RuntimeException e) {
+            log.error("Put failed for key={}", record.key(), e);
             throw new StorageException("put", e);
         }
     }
 
     @Override
     public Optional<KvRecord> get(String key) {
+        Objects.requireNonNull(key, "key must not be null");
+
         try {
-            SelectResponse<List<Tuple<List<?>>>> resp =
-                    space.select(Arrays.asList(key)).get();
-            List<Tuple<List<?>>> rows = resp.get();
+            SelectResponse<List<Tuple<List<?>>>> response = space.select(List.of(key)).get();
+            List<Tuple<List<?>>> rows = response.get();
 
             if (rows == null || rows.isEmpty()) {
-                log.debug("get key={} → not found", key);
+                log.debug("Get returned no record for key={}", key);
                 return Optional.empty();
             }
-            log.debug("get key={} → found", key);
-            return Optional.of(toRecord(rows.get(0).get()));
-        } catch (Exception e) {
-            log.error("get failed: key={}", key, e);
+
+            KvRecord record = toRecord(rows.get(0).get());
+            log.debug("Get succeeded for key={}", key);
+            return Optional.of(record);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Get interrupted for key={}", key, e);
+            throw new StorageException("get", e);
+        } catch (ExecutionException | RuntimeException e) {
+            log.error("Get failed for key={}", key, e);
             throw new StorageException("get", e);
         }
     }
 
     @Override
     public boolean delete(String key) {
+        Objects.requireNonNull(key, "key must not be null");
+
         try {
-            Tuple<List<?>> deleted = space.delete(Arrays.asList(key)).get();
-            boolean existed = deleted != null
-                    && deleted.get() != null
-                    && !deleted.get().isEmpty();
-            log.debug("delete key={} → existed={}", key, existed);
+            Tuple<List<?>> deletedTuple = space.delete(List.of(key)).get();
+            boolean existed = deletedTuple != null
+                    && deletedTuple.get() != null
+                    && !deletedTuple.get().isEmpty();
+
+            log.debug("Delete completed for key={}, existed={}", key, existed);
             return existed;
-        } catch (Exception e) {
-            log.error("delete failed: key={}", key, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Delete interrupted for key={}", key, e);
+            throw new StorageException("delete", e);
+        } catch (ExecutionException | RuntimeException e) {
+            log.error("Delete failed for key={}", key, e);
             throw new StorageException("delete", e);
         }
     }
 
-    /**
-     * Paginated range scan over the TREE primary index.
-     * Semantics: [keySince, keyTo] — both endpoints inclusive.
-     *   • first batch  — GE from keySince (includes keySince)
-     *   • next batches — GT from last seen key (strictly after it)
-     */
     @Override
     public void range(String keySince, String keyTo, Consumer<KvRecord> sink) {
+        Objects.requireNonNull(keySince, "keySince must not be null");
+        Objects.requireNonNull(keyTo, "keyTo must not be null");
+        Objects.requireNonNull(sink, "sink must not be null");
+
         try {
-            String  currentKey = keySince;
-            boolean first      = true;
-            long    delivered  = 0;
+            String currentKey = keySince;
+            boolean firstBatch = true;
+            long delivered = 0;
 
             outer:
             while (true) {
-                SelectOptions opts = SelectOptions.builder()
-                        .withIterator(first ? BoxIterator.GE : BoxIterator.GT)
+                SelectOptions options = SelectOptions.builder()
+                        .withIterator(firstBatch ? BoxIterator.GE : BoxIterator.GT)
                         .withLimit(BATCH_SIZE)
                         .build();
-                first = false;
+                firstBatch = false;
 
-                SelectResponse<List<Tuple<List<?>>>> resp =
-                        space.select(Arrays.asList(currentKey), opts).get();
-                List<Tuple<List<?>>> rows = resp.get();
+                SelectResponse<List<Tuple<List<?>>>> response =
+                        space.select(List.of(currentKey), options).get();
+                List<Tuple<List<?>>> rows = response.get();
 
-                if (rows == null || rows.isEmpty()) break;
+                if (rows == null || rows.isEmpty()) {
+                    break;
+                }
 
                 for (Tuple<List<?>> tuple : rows) {
-                    List<?> fields = tuple.get();
-                    String  key    = (String) fields.get(0);
+                    KvRecord record = toRecord(tuple.get());
 
-                    if (key.compareTo(keyTo) > 0) break outer;
+                    if (record.key().compareTo(keyTo) > 0) {
+                        break outer;
+                    }
 
-                    sink.accept(toRecord(fields));
-                    currentKey = key;
+                    sink.accept(record);
+                    currentKey = record.key();
                     delivered++;
                 }
 
-                if (rows.size() < BATCH_SIZE) break;
+                if (rows.size() < BATCH_SIZE) {
+                    break;
+                }
             }
-            log.debug("range [{}, {}] → {} records delivered", keySince, keyTo, delivered);
-        } catch (Exception e) {
-            log.error("range failed: keySince={} keyTo={}", keySince, keyTo, e);
+
+            log.debug(
+                    "Range completed for keySince={}, keyTo={}, delivered={}",
+                    keySince,
+                    keyTo,
+                    delivered
+            );
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Range interrupted for keySince={}, keyTo={}", keySince, keyTo, e);
+            throw new StorageException("range", e);
+        } catch (ExecutionException | RuntimeException e) {
+            log.error("Range failed for keySince={}, keyTo={}", keySince, keyTo, e);
             throw new StorageException("range", e);
         }
     }
 
-    /** Uses box.space.KV:len() — O(1) for memtx engine. */
     @Override
     public long count() {
         try {
-            var result = client.eval("return box.space.KV:len()").get();
-            long count = ((Number) result.get().get(0)).longValue();
-            log.debug("count → {}", count);
+            var result = client.eval(COUNT_QUERY).get();
+            Object rawCount = result.get().get(0);
+
+            if (!(rawCount instanceof Number number)) {
+                throw new IllegalStateException("Unexpected count result type: " + rawCount);
+            }
+
+            long count = number.longValue();
+            log.debug("Count completed for space={}, count={}", SPACE_NAME, count);
             return count;
-        } catch (Exception e) {
-            log.error("count failed", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Count interrupted for space={}", SPACE_NAME, e);
+            throw new StorageException("count", e);
+        } catch (ExecutionException | RuntimeException e) {
+            log.error("Count failed for space={}", SPACE_NAME, e);
             throw new StorageException("count", e);
         }
     }
 
-
     private KvRecord toRecord(List<?> fields) {
-        return new KvRecord((String) fields.get(0), (byte[]) fields.get(1));
+        Objects.requireNonNull(fields, "fields must not be null");
+
+        if (fields.size() < RECORD_FIELD_COUNT) {
+            throw new IllegalStateException("Tuple has fewer fields than expected: " + fields.size());
+        }
+
+        Object rawKey = fields.get(KEY_FIELD_INDEX);
+        Object rawValue = fields.get(VALUE_FIELD_INDEX);
+
+        if (!(rawKey instanceof String key)) {
+            throw new IllegalStateException("Tuple field 0 is not a String: " + rawKey);
+        }
+
+        if (rawValue != null && !(rawValue instanceof byte[])) {
+            throw new IllegalStateException("Tuple field 1 is not byte[] or null: " + rawValue);
+        }
+
+        return new KvRecord(key, (byte[]) rawValue);
     }
 }

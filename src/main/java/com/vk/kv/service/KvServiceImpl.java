@@ -4,6 +4,7 @@ import com.vk.kv.model.KvRecord;
 import com.vk.kv.repository.KvRepository;
 import lombok.extern.slf4j.Slf4j;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 
@@ -13,7 +14,7 @@ public class KvServiceImpl implements KvService {
     private final KvRepository repository;
 
     public KvServiceImpl(KvRepository repository) {
-        this.repository = repository;
+        this.repository = Objects.requireNonNull(repository, "repository must not be null");
     }
 
     @Override

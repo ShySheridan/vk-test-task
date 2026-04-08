@@ -3,23 +3,31 @@ package com.vk.kv.config;
 import io.tarantool.client.box.TarantoolBoxClient;
 import io.tarantool.client.factory.TarantoolFactory;
 
-public class TarantoolClientConfig {
+import java.util.Objects;
 
-    private static final String HOST =
-            System.getenv().getOrDefault("TARANTOOL_HOST", "localhost");
-    private static final int PORT =
-            Integer.parseInt(System.getenv().getOrDefault("TARANTOOL_PORT", "3301"));
-    private static final String USER =
-            System.getenv().getOrDefault("TARANTOOL_USER", "app");
-    private static final String PASSWORD =
-            System.getenv().getOrDefault("TARANTOOL_PASSWORD", "app_password");
+public final class TarantoolClientConfig {
 
-    public static TarantoolBoxClient buildClient() throws Exception {
-        return TarantoolFactory.box()
-                .withHost(HOST)
-                .withPort(PORT)
-                .withUser(USER)
-                .withPassword(PASSWORD)
-                .build();
+    private TarantoolClientConfig() {
+    }
+
+    public static TarantoolBoxClient buildClient(AppConfig appConfig) {
+        Objects.requireNonNull(appConfig, "appConfig must not be null");
+
+        try {
+            return TarantoolFactory.box()
+                    .withHost(appConfig.tarantoolHost())
+                    .withPort(appConfig.tarantoolPort())
+                    .withUser(appConfig.tarantoolUser())
+                    .withPassword(appConfig.tarantoolPassword())
+                    .build();
+        } catch (Exception e) {
+            throw new IllegalStateException(
+                    "Failed to create Tarantool client for "
+                            + appConfig.tarantoolHost()
+                            + ":"
+                            + appConfig.tarantoolPort(),
+                    e
+            );
+        }
     }
 }
